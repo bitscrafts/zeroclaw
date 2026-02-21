@@ -1705,6 +1705,27 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
+        // Do a timeout=0 probe on startup to displace any stale long-poll session left
+        // by a previous process. Without this, a restarted daemon gets 409 for up to 30s
+        // while Telegram's server holds the old session open.
+        let probe_url = self.api_url("getUpdates");
+        let probe_body = serde_json::json!({
+            "offset": offset,
+            "timeout": 0,
+            "allowed_updates": ["message"]
+        });
+        if let Ok(resp) = self.http_client().post(&probe_url).json(&probe_body).send().await {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
+                    for update in results {
+                        if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
+                            offset = uid + 1;
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!("Telegram channel listening for messages...");
 
         loop {
@@ -1759,7 +1780,9 @@ impl Channel for TelegramChannel {
                         "Telegram polling conflict (409): {description}. \
 Ensure only one `zeroclaw` process is using this bot token."
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Back off longer than the poll timeout (30s) so the conflicting
+                    // session has time to expire before we retry.
+                    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
                 } else {
                     tracing::warn!(
                         "Telegram getUpdates API error (code={}): {description}",
